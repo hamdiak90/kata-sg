@@ -38,6 +38,24 @@ Je suis DevOps, pas développeur. J'ai préféré passer le temps imparti sur le
 | Application Insights (OpenTelemetry) | Natif Azure, la distro OpenTelemetry instrumente FastAPI et psycopg2 sans effort, rien à héberger. | Stack Grafana/Loki/Mimir : c'est ce que je connais le mieux, mais il faut l'héberger et l'exploiter, hors de propos ici. |
 | Échantillonnage des traces à 10 % | Ne pas dépasser le plafond de 1 Go/jour pendant les tests de charge. | |
 
+## Lancer en local
+
+```bash
+docker compose up --build
+```
+
+- Front : http://localhost:8080
+- API : http://localhost:8000/health
+
+La télémétrie est désactivée en local (pas de `APPLICATIONINSIGHTS_CONNECTION_STRING`).
+
+## Sécurité de la configuration
+
+- Aucun secret Azure dans GitHub : connexion OIDC, jeton court par job.
+- Le mot de passe de la base est un secret GitHub, puis un secret Container Apps (`secretref:`) : il n'apparaît ni dans le repo, ni dans la configuration de l'app, ni dans les logs (`--output none`).
+- La connection string App Insights est elle aussi un secret de l'app.
+- La route de panne `/api/crash` est désactivée par défaut (`CHAOS_ENABLED`).
+
 ## Déployer
 
 ```bash
@@ -304,10 +322,13 @@ az ad app list --display-name gh-kata --query "[].appId" -o tsv
 | Groupe de ressources | `false` |
 | Identité GitHub | rien (supprimée) |
 
-## Limites et ce que je ferais ensuite
+## Limites et améliorations pour la production
 
-- L'autoscaling met un moment à réagir : sur un pic court, les replicas arrivent après le pic.
-- Pas de télémétrie côté front.
-- La base est en accès public restreint aux services Azure. En production je la mettrais en réseau privé (VNet + private endpoint).
-- Pas d'alertes. Les premières à ajouter : p95 et taux d'erreurs de l'API.
-- Infra en Azure CLI : à passer en Terraform dès que le projet dure plus de quelques jours.
+- **Infra en code** : Terraform ou Bicep plutôt que l'Azure CLI, avec un état versionné.
+- **Réseau privé** : VNet et accès privé à PostgreSQL, au lieu d'un accès public réservé à Azure.
+- **Secrets** : Key Vault et authentification Entra ID vers la base, sans mot de passe.
+- **Disponibilité de la base** : haute disponibilité de zone et sauvegardes testées (B1ms n'est pas fait pour la production).
+- **Alertes** : sur le p95, le taux d'erreurs et les redémarrages de replicas.
+- **Scaling** : `min-replicas` adapté aux pics, car le scale-out a un délai.
+- **Livraison** : environnement de staging et bascule progressive du trafic entre révisions.
+- **Front** : télémétrie navigateur, CDN et WAF devant l'application.

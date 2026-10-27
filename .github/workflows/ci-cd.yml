@@ -1,12 +1,16 @@
 name: ci-cd
 
+concurrency:
+  group: ci-cd-${{ github.ref }}
+  cancel-in-progress: false   # pour que ça ne coupe pas un deploy in progress
+
 on:
   push:
     branches: [main]
-  workflow_dispatch:    # je l'ai ajouté pour que je puisse faire un run workflow sans commit
+  workflow_dispatch:
 
 permissions:
-  contents: read        # le jeton GitHub peut seulement lire le code
+  contents: read 
 
 jobs:
   test:
@@ -33,3 +37,20 @@ jobs:
         run: pip install -r backend/requirements-dev.txt
       - name: Lancer les tests
         run: pytest -v backend
+  deploy:
+    needs: test               # le deploy se joue que quand les tests sont OK
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write         # pour demander le jeton OIDC à GitHub
+    env:
+      RG: rg-kata
+    steps:
+      - name: Connexion à Azure (OIDC, sans secret)
+        uses: azure/login@v3
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      - name: Vérifier l'accès au groupe de ressources
+        run: az group show -n "$RG" -o table

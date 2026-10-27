@@ -2,21 +2,21 @@ name: ci-cd
 
 on:
   push:
-    branches: [main] 
-  workflow_dispatch: 
+    branches: [main]    # chaque push sur main
+  workflow_dispatch:    # bouton « Run workflow »
 
 permissions:
-  contents: read     
+  contents: read        # le jeton GitHub peut seulement lire le code
 
 concurrency:
   group: ci-cd-${{ github.ref }}
-  cancel-in-progress: false  
+  cancel-in-progress: false   # on ne coupe jamais un déploiement en cours
 
 jobs:
   test:
     runs-on: ubuntu-24.04
     services:
-      postgres:  
+      postgres:         # base jetable pour les tests, supprimée à la fin du job
         image: postgres:16-alpine
         env:
           POSTGRES_DB: app
@@ -39,18 +39,18 @@ jobs:
         run: pytest -v backend
 
   deploy:
-    needs: test             
+    needs: test               # seulement si les tests passent
     runs-on: ubuntu-24.04
     permissions:
       contents: read
-      id-token: write         
+      id-token: write         # pour demander le jeton OIDC à GitHub
     env:
       RG: rg-kata
       LOCATION: francecentral
-      ACR: acrkatahamdi     
+      ACR: acrkatahamdi      
       ENV_NAME: cae-kata
-      PG: pg-kata-hamdi      
-      TAG: ${{ github.sha }}  
+      PG: pg-kata-hamdi   
+      TAG: ${{ github.sha }}
     steps:
       - name: Récupérer le code
         uses: actions/checkout@v7
@@ -91,7 +91,14 @@ jobs:
             az containerapp env create --name "$ENV_NAME" --resource-group "$RG" --location "$LOCATION" \
               --logs-workspace-id "$LAW_ID" --logs-workspace-key "$LAW_KEY" --output none
           fi
-
+      - name: Créer Application Insights (s'il n'existe pas)
+        run: |
+          az config set extension.use_dynamic_install=yes_without_prompt
+          if ! az monitor app-insights component show --app appin-kata --resource-group "$RG" --output none 2>/dev/null; then
+            LAW_RID=$(az monitor log-analytics workspace show --name law-kata --resource-group "$RG" --query id --output tsv)
+            az monitor app-insights component create --app appin-kata --resource-group "$RG" \
+              --location "$LOCATION" --workspace "$LAW_RID" --output none
+          fi
       - name: Créer la base PostgreSQL (si elle n'existe pas)
         env:
           DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
@@ -100,6 +107,8 @@ jobs:
             echo "::error::Le secret DB_PASSWORD n'existe pas : crée-le avec gh secret set"
             exit 1
           fi
+          # 0.0.0.0 = accès autorisé depuis Azure seulement ; mot de passe et TLS obligatoires
+          # --output none : sinon la commande affiche le mot de passe dans les logs
           if ! az postgres flexible-server show --name "$PG" --resource-group "$RG" --output none 2>/dev/null; then
             az postgres flexible-server create --name "$PG" --resource-group "$RG" --location "$LOCATION" \
               --tier Burstable --sku-name Standard_B1ms --storage-size 32 --version 16 \
@@ -128,17 +137,20 @@ jobs:
               --scale-rule-name http-rule --scale-rule-http-concurrency 10 \
               --output none
           fi
-          # Le mot de passe devient un secret de l'app : il n'apparaît jamais dans sa configuration
+          # Chaîne de connexion App Insights : traitée comme un secret
+          AI_CS=$(az monitor app-insights component show --app appin-kata --resource-group "$RG" --query connectionString --output tsv)
           az containerapp secret set --name api --resource-group "$RG" \
-            --secrets db-password="$DB_PASSWORD" --output none
+            --secrets db-password="$DB_PASSWORD" appinsights-cs="$AI_CS" --output none
           # À chaque push : la nouvelle image, donc une nouvelle révision
           az containerapp update --name api --resource-group "$RG" \
             --image "$ACR.azurecr.io/api:$TAG" \
             --set-env-vars APP_VERSION="$TAG" WEB_ORIGIN="https://web.$DOMAIN" \
               DB_HOST="$PG.postgres.database.azure.com" DB_USER=appadmin \
               DB_PASSWORD=secretref:db-password DB_SSLMODE=require \
+              APPLICATIONINSIGHTS_CONNECTION_STRING=secretref:appinsights-cs \
+              TRACE_SAMPLING_RATIO=0.1 \
             --output none
-
+            
       - name: Déployer le front
         run: |
           DOMAIN=$(az containerapp env show --name "$ENV_NAME" --resource-group "$RG" --query properties.defaultDomain --output tsv)

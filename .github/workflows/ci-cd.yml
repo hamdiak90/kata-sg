@@ -2,20 +2,21 @@ name: ci-cd
 
 on:
   push:
-    branches: [main]    # declenché a chaque push en main
-  workflow_dispatch:
+    branches: [main] 
+  workflow_dispatch: 
 
 permissions:
-  contents: read      
+  contents: read     
 
 concurrency:
   group: ci-cd-${{ github.ref }}
-  cancel-in-progress: false 
+  cancel-in-progress: false  
+
 jobs:
   test:
     runs-on: ubuntu-24.04
     services:
-      postgres:         
+      postgres:  
         image: postgres:16-alpine
         env:
           POSTGRES_DB: app
@@ -38,17 +39,18 @@ jobs:
         run: pytest -v backend
 
   deploy:
-    needs: test               
+    needs: test             
     runs-on: ubuntu-24.04
     permissions:
       contents: read
-      id-token: write         # pour demander le jeton OIDC à GitHub
+      id-token: write         
     env:
       RG: rg-kata
       LOCATION: francecentral
-      ACR: acrkatahamdi 
+      ACR: acrkatahamdi     
       ENV_NAME: cae-kata
-      TAG: ${{ github.sha }}
+      PG: pg-kata-hamdi      
+      TAG: ${{ github.sha }}  
     steps:
       - name: Récupérer le code
         uses: actions/checkout@v7
@@ -60,10 +62,13 @@ jobs:
           tenant-id: ${{ vars.AZURE_TENANT_ID }}
           subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
 
-      - name: Créer le registre d'images 
+      - name: Créer le registre d'images (s'il n'existe pas)
         run: |
-          az acr create --name "$ACR" --resource-group "$RG" --sku Basic --output none
-
+          if az acr show --name "$ACR" --resource-group "$RG" --output none 2>/dev/null; then
+            echo "Le registre $ACR existe déjà"
+          else
+            az acr create --name "$ACR" --resource-group "$RG" --sku Basic --output none
+          fi
 
       - name: Construire et pousser les images
         run: |
@@ -87,10 +92,33 @@ jobs:
               --logs-workspace-id "$LAW_ID" --logs-workspace-key "$LAW_KEY" --output none
           fi
 
+      - name: Créer la base PostgreSQL (si elle n'existe pas)
+        env:
+          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+        run: |
+          if [ -z "$DB_PASSWORD" ]; then
+            echo "::error::Le secret DB_PASSWORD n'existe pas : crée-le avec gh secret set"
+            exit 1
+          fi
+          if ! az postgres flexible-server show --name "$PG" --resource-group "$RG" --output none 2>/dev/null; then
+            az postgres flexible-server create --name "$PG" --resource-group "$RG" --location "$LOCATION" \
+              --tier Burstable --sku-name Standard_B1ms --storage-size 32 --version 16 \
+              --admin-user appadmin --admin-password "$DB_PASSWORD" \
+              --public-access 0.0.0.0 --yes --output none
+          fi
+          if ! az postgres flexible-server db show --server-name "$PG" --resource-group "$RG" --name app --output none 2>/dev/null; then
+            az postgres flexible-server db create --server-name "$PG" --resource-group "$RG" --name app --output none
+          fi
+
       - name: Déployer l'API
+        env:
+          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
         run: |
           DOMAIN=$(az containerapp env show --name "$ENV_NAME" --resource-group "$RG" --query properties.defaultDomain --output tsv)
           if ! az containerapp show --name api --resource-group "$RG" --output none 2>/dev/null; then
+            # Première fois seulement. Le CLI essaie aussi de donner lui-même le droit AcrPull :
+            # il échoue au bout d'une minute (le pipeline n'a pas ce droit) et continue.
+            # C'est normal, le droit existe déjà grâce au bootstrap.
             PULL_IDENTITY=$(az identity show --name id-kata-pull --resource-group "$RG" --query id --output tsv)
             az containerapp create --name api --resource-group "$RG" --environment "$ENV_NAME" \
               --image "$ACR.azurecr.io/api:$TAG" \
@@ -100,10 +128,15 @@ jobs:
               --scale-rule-name http-rule --scale-rule-http-concurrency 10 \
               --output none
           fi
-
+          # Le mot de passe devient un secret de l'app : il n'apparaît jamais dans sa configuration
+          az containerapp secret set --name api --resource-group "$RG" \
+            --secrets db-password="$DB_PASSWORD" --output none
+          # À chaque push : la nouvelle image, donc une nouvelle révision
           az containerapp update --name api --resource-group "$RG" \
             --image "$ACR.azurecr.io/api:$TAG" \
             --set-env-vars APP_VERSION="$TAG" WEB_ORIGIN="https://web.$DOMAIN" \
+              DB_HOST="$PG.postgres.database.azure.com" DB_USER=appadmin \
+              DB_PASSWORD=secretref:db-password DB_SSLMODE=require \
             --output none
 
       - name: Déployer le front

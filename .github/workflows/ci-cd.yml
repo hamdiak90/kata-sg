@@ -1,0 +1,35 @@
+name: ci-cd
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:    # je l'ai ajouté pour que je puisse faire un run workflow sans commit
+
+permissions:
+  contents: read        # le jeton GitHub peut seulement lire le code
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    services:
+      postgres:         # base jetable pour les tests, supprimée à la fin du job
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: app
+          POSTGRES_USER: app
+          POSTGRES_PASSWORD: app
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U app"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    steps:
+      - name: Récupérer le code
+        uses: actions/checkout@v7
+      - name: Installer Python 3.12
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Installer les dépendances de test
+        run: pip install -r backend/requirements-dev.txt
+      - name: Lancer les tests
+        run: pytest -v backend

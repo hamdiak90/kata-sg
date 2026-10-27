@@ -1,17 +1,16 @@
 name: ci-cd
 
-concurrency:
-  group: ci-cd-${{ github.ref }}
-  cancel-in-progress: false
-
 on:
   push:
-    branches: [main]
-  workflow_dispatch: 
+    branches: [main]    # declenché a chaque push en main
+  workflow_dispatch:
 
 permissions:
-  contents: read       
+  contents: read      
 
+concurrency:
+  group: ci-cd-${{ github.ref }}
+  cancel-in-progress: false 
 jobs:
   test:
     runs-on: ubuntu-24.04
@@ -37,15 +36,18 @@ jobs:
         run: pip install -r backend/requirements-dev.txt
       - name: Lancer les tests
         run: pytest -v backend
+
   deploy:
-    needs: test             
+    needs: test               
     runs-on: ubuntu-24.04
     permissions:
       contents: read
-      id-token: write         
+      id-token: write         # pour demander le jeton OIDC à GitHub
     env:
       RG: rg-kata
-      ACR: acrkatahamdi  
+      LOCATION: francecentral
+      ACR: acrkatahamdi 
+      ENV_NAME: cae-kata
       TAG: ${{ github.sha }}
     steps:
       - name: Récupérer le code
@@ -58,9 +60,10 @@ jobs:
           tenant-id: ${{ vars.AZURE_TENANT_ID }}
           subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
 
-      - name: Créer le registre d'images
+      - name: Créer le registre d'images 
         run: |
           az acr create --name "$ACR" --resource-group "$RG" --sku Basic --output none
+
 
       - name: Construire et pousser les images
         run: |
@@ -69,3 +72,54 @@ jobs:
           docker build -t "$ACR.azurecr.io/web:$TAG" frontend
           docker push "$ACR.azurecr.io/api:$TAG"
           docker push "$ACR.azurecr.io/web:$TAG"
+
+      - name: Créer l'environnement Container Apps (s'il n'existe pas)
+        run: |
+          # L'espace de logs reçoit les logs des conteneurs (plafond : 1 Go par jour)
+          if ! az monitor log-analytics workspace show --name law-kata --resource-group "$RG" --output none 2>/dev/null; then
+            az monitor log-analytics workspace create --name law-kata --resource-group "$RG" \
+              --location "$LOCATION" --quota 1 --output none
+          fi
+          if ! az containerapp env show --name "$ENV_NAME" --resource-group "$RG" --output none 2>/dev/null; then
+            LAW_ID=$(az monitor log-analytics workspace show --name law-kata --resource-group "$RG" --query customerId --output tsv)
+            LAW_KEY=$(az monitor log-analytics workspace get-shared-keys --name law-kata --resource-group "$RG" --query primarySharedKey --output tsv)
+            az containerapp env create --name "$ENV_NAME" --resource-group "$RG" --location "$LOCATION" \
+              --logs-workspace-id "$LAW_ID" --logs-workspace-key "$LAW_KEY" --output none
+          fi
+
+      - name: Déployer l'API
+        run: |
+          DOMAIN=$(az containerapp env show --name "$ENV_NAME" --resource-group "$RG" --query properties.defaultDomain --output tsv)
+          if ! az containerapp show --name api --resource-group "$RG" --output none 2>/dev/null; then
+            PULL_IDENTITY=$(az identity show --name id-kata-pull --resource-group "$RG" --query id --output tsv)
+            az containerapp create --name api --resource-group "$RG" --environment "$ENV_NAME" \
+              --image "$ACR.azurecr.io/api:$TAG" \
+              --registry-server "$ACR.azurecr.io" --registry-identity "$PULL_IDENTITY" \
+              --ingress external --target-port 8000 \
+              --min-replicas 2 --max-replicas 6 \
+              --scale-rule-name http-rule --scale-rule-http-concurrency 10 \
+              --output none
+          fi
+
+          az containerapp update --name api --resource-group "$RG" \
+            --image "$ACR.azurecr.io/api:$TAG" \
+            --set-env-vars APP_VERSION="$TAG" WEB_ORIGIN="https://web.$DOMAIN" \
+            --output none
+
+      - name: Déployer le front
+        run: |
+          DOMAIN=$(az containerapp env show --name "$ENV_NAME" --resource-group "$RG" --query properties.defaultDomain --output tsv)
+          if ! az containerapp show --name web --resource-group "$RG" --output none 2>/dev/null; then
+            PULL_IDENTITY=$(az identity show --name id-kata-pull --resource-group "$RG" --query id --output tsv)
+            az containerapp create --name web --resource-group "$RG" --environment "$ENV_NAME" \
+              --image "$ACR.azurecr.io/web:$TAG" \
+              --registry-server "$ACR.azurecr.io" --registry-identity "$PULL_IDENTITY" \
+              --ingress external --target-port 8080 \
+              --min-replicas 1 --max-replicas 3 \
+              --output none
+          fi
+          az containerapp update --name web --resource-group "$RG" \
+            --image "$ACR.azurecr.io/web:$TAG" \
+            --set-env-vars API_URL="https://api.$DOMAIN" \
+            --output none
+          echo "Application en ligne : https://web.$DOMAIN"
